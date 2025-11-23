@@ -1,0 +1,1164 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>Encryption 도구 (AES + PBKDF2 + RSA)</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    input, button, select { padding: 8px; font-size: 14px; }
+
+    nav a { margin-right: 12px; text-decoration: none; color: #0070c9; }
+    nav a.active { font-weight: bold; text-decoration: underline; }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .row input[type="text"],
+    .row input[type="number"] {
+      flex: 1;
+      padding: 8px;
+      box-sizing: border-box;
+    }
+
+    .len-box {
+      width: 180px;
+      font-size: 12px;
+      color: #555;
+      text-align: right;
+    }
+
+    .result-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 5px;
+      margin-bottom: 10px;
+    }
+
+    .result-box {
+      flex: 1;
+      background: #f7f7f7;
+      padding: 8px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+      white-space: pre-wrap;
+      min-height: 38px;
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      overflow-y: auto;
+    }
+
+    .result-box.key-output {
+      font-size: 12px; /* RSA 키 출력은 Base64로 길어질 수 있어 글자 크기 조정 */
+    }
+
+    .copy-btn {
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+
+    .option-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 8px;
+      font-size: 14px;
+      flex-wrap: wrap;
+    }
+
+    small.note { color: #777; }
+    hr { margin: 20px 0; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <a href="encoding.html">Encoding</a>
+  <a href="hash.html">Hash</a>
+  <a href="encryption.html" class="active">Encryption</a>
+</nav>
+<hr>
+
+<script>
+  /* ============ 공통 유틸 ============ */
+
+  function getByteLength(str) {
+    return new Blob([str]).size;
+  }
+
+  function formatLength(chars, bytes) {
+    const charLabel = (chars === 1) ? "character" : "characters";
+    const byteLabel = (bytes === 1) ? "byte" : "bytes";
+    return `${chars} ${charLabel}, ${bytes} ${byteLabel}`;
+  }
+
+  function updateLengthFromInput(id, lenId) {
+    const v = document.getElementById(id).value || "";
+    document.getElementById(lenId).innerText =
+      formatLength(v.length, getByteLength(v));
+  }
+
+  function updateLengthFromElementText(id, lenId) {
+    const v = document.getElementById(id).innerText || "";
+    document.getElementById(lenId).innerText =
+      formatLength(v.length, getByteLength(v));
+  }
+
+  function copyInput(id) {
+    const v = document.getElementById(id).value || "";
+    if (!v.trim()) { alert("복사할 내용이 없습니다."); return; }
+    navigator.clipboard.writeText(v).then(() => alert("복사되었습니다."));
+  }
+
+  function copyText(id) {
+    const v = document.getElementById(id).innerText || "";
+    if (!v.trim()) { alert("복사할 내용이 없습니다."); return; }
+    // IV 안내 문구 제거
+    const cleanV = v.split('\n')[0].trim();
+    navigator.clipboard.writeText(cleanV).then(() => alert("복사되었습니다."));
+  }
+
+  function hexToBytes(hex) {
+    const clean = hex.replace(/\s+/g, "");
+    if (clean.length % 2 !== 0) throw new Error("invalid hex length");
+    const arr = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < clean.length; i += 2) {
+      const b = parseInt(clean.substr(i, 2), 16);
+      if (isNaN(b)) throw new Error("invalid hex");
+      arr[i / 2] = b;
+    }
+    return arr;
+  }
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  }
+
+  function bytesToHex(bytes) {
+    let hex = "";
+    for (let b of bytes) hex += b.toString(16).padStart(2, "0");
+    return hex.toUpperCase();
+  }
+
+  function bytesToBase64(bytes) {
+    let bin = "";
+    for (let b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin);
+  }
+
+  function textToBytes(str) {
+    return new TextEncoder().encode(str);
+  }
+
+  function bytesToText(bytes) {
+    return new TextDecoder().decode(bytes);
+  }
+
+  /* ============ AES / IV UI ============ */
+
+  function updateIvVisibility() {
+    const mode = document.getElementById("aesBlockMode").value;
+    const ivMode = document.getElementById("aesIvMode").value;
+    const ivRow = document.getElementById("ivRow");
+
+    // CBC/CTR/GCM만 IV 필요
+    if (!["cbc", "ctr", "gcm"].includes(mode)) {
+      ivRow.style.display = "none";
+      return;
+    }
+
+    // CBC/CTR/GCM + IV 모드
+    if (ivMode === "auto") {
+      ivRow.style.display = "none";
+    } else {
+      ivRow.style.display = "flex";
+    }
+  }
+
+  function onBlockModeChange() {
+    updateIvVisibility();
+  }
+
+  function onIvModeChange() {
+    updateIvVisibility();
+  }
+
+  /* ============ PBKDF2 UI ============ */
+
+  function onPbkdf2SaltEncodingChange() {
+    const enc = document.getElementById("pbkdf2SaltEncoding").value;
+    const row = document.getElementById("pbkdf2SaltRow");
+    if (enc === "auto") {
+      row.style.display = "none";
+    } else {
+      row.style.display = "flex";
+    }
+  }
+
+  function initLengths() {
+    // PBKDF2
+    updateLengthFromInput("pbkdf2SecretInput", "lenPbkdf2SecretInput");
+    updateLengthFromInput("pbkdf2SaltInput", "lenPbkdf2SaltInput");
+    updateLengthFromElementText("pbkdf2Result", "lenPbkdf2Result");
+
+    // AES
+    updateLengthFromInput("aesInput", "lenAesInput");
+    updateLengthFromInput("aesKeyInput", "lenAesKeyInput");
+    updateLengthFromInput("aesIvInput", "lenAesIvInput");
+    updateLengthFromElementText("aesResult", "lenAesResult");
+
+    // RSA
+    updateLengthFromInput("rsaDataInput", "lenRsaDataInput");
+    updateLengthFromInput("rsaPublicKeyInput", "lenRsaPublicKeyInput");
+    updateLengthFromInput("rsaPrivateKeyInput", "lenRsaPrivateKeyInput");
+    updateLengthFromElementText("rsaResult", "lenRsaResult");
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    onBlockModeChange();
+    onPbkdf2SaltEncodingChange();
+    initLengths();
+  });
+
+  /* ============ IV 랜덤 생성 ============ */
+  function generateRandomIv(mode) {
+    let len = 16;          // CBC/CTR 기본 16바이트
+    if (mode === "gcm") {  // GCM은 12바이트(96bit) 권장
+      len = 12;
+    }
+    const iv = new Uint8Array(len);
+    crypto.getRandomValues(iv);
+    return iv;
+  }
+
+  /* ============ AES 암/복호화 (기존 코드) ============ */
+
+  async function runAes() {
+    // ... (기존 AES 암/복호화 로직 유지)
+    const op = document.getElementById("aesOperation").value;
+    const dataFormat = document.getElementById("aesDataFormat").value;
+    const keyEnc = document.getElementById("aesKeyEncoding").value;
+    const keyBits = parseInt(document.getElementById("aesKeySize").value, 10);
+    const mode = document.getElementById("aesBlockMode").value;
+    const padding = document.getElementById("aesPadding").value;
+
+    const encOutEnc = document.getElementById("aesEncryptEncoding").value;
+    const decOutFormat = document.getElementById("aesDecryptOutputFormat").value;
+
+    const dataStr = document.getElementById("aesInput").value;
+    const keyStr = document.getElementById("aesKeyInput").value;
+    const ivStr  = document.getElementById("aesIvInput").value;
+    const ivMode = document.getElementById("aesIvMode").value;
+
+    const resultDiv = document.getElementById("aesResult");
+
+    if (!window.crypto || !window.crypto.subtle) {
+      resultDiv.innerText = "이 브라우저에서는 Web Crypto API(crypto.subtle)를 지원하지 않습니다.";
+      updateLengthFromElementText("aesResult", "lenAesResult");
+      return;
+    }
+
+    // 지원 모드 제한
+    if (["ecb", "cfb", "ofb"].includes(mode)) {
+      resultDiv.innerText = "선택한 블록모드(" + mode.toUpperCase() +
+        ")는 브라우저 Web Crypto API에서 지원되지 않습니다.";
+      updateLengthFromElementText("aesResult", "lenAesResult");
+      return;
+    }
+
+    // Padding 제약: Web Crypto는 CBC에서 내부적으로 PKCS#7 패딩 사용, 선택 불가
+    if (mode === "cbc" && padding !== "pkcs7") {
+      resultDiv.innerText = "AES-CBC는 Web Crypto에서 PKCS#7 패딩만 지원합니다. padding을 pkcs7로 선택해 주세요.";
+      updateLengthFromElementText("aesResult", "lenAesResult");
+      return;
+    }
+    if (["ctr", "gcm"].includes(mode) && padding !== "nopad") {
+      resultDiv.innerText = "AES-" + mode.toUpperCase() +
+        " 모드는 패딩 개념이 없으므로 padding = nopad 로 사용하는 것이 안전합니다.";
+      updateLengthFromElementText("aesResult", "lenAesResult");
+      return;
+    }
+
+    if (!dataStr) {
+      resultDiv.innerText = "데이터를 입력해 주세요.";
+      updateLengthFromElementText("aesResult", "lenAesResult");
+      return;
+    }
+    if (!keyStr) {
+      resultDiv.innerText = "키를 입력해 주세요.";
+      updateLengthFromElementText("aesResult", "lenAesResult");
+      return;
+    }
+
+    try {
+      // 1. 키 처리
+      let keyBytes;
+      if (keyEnc === "hex") keyBytes = hexToBytes(keyStr);
+      else keyBytes = base64ToBytes(keyStr);
+
+      if (![16, 32].includes(keyBytes.length)) {
+        resultDiv.innerText =
+          "키 길이가 올바르지 않습니다. AES-128은 16바이트, AES-256은 32바이트 키가 필요합니다.";
+        updateLengthFromElementText("aesResult", "lenAesResult");
+        return;
+      }
+      if (keyBits === 128 && keyBytes.length !== 16) {
+        resultDiv.innerText = "선택한 키 길이(128bit)에 맞게 16바이트 키를 입력해 주세요.";
+        updateLengthFromElementText("aesResult", "lenAesResult");
+        return;
+      }
+      if (keyBits === 256 && keyBytes.length !== 32) {
+        resultDiv.innerText = "선택한 키 길이(256bit)에 맞게 32바이트 키를 입력해 주세요.";
+        updateLengthFromElementText("aesResult", "lenAesResult");
+        return;
+      }
+
+      // 2. IV 처리 (CBC / CTR / GCM)
+      let ivBytes = null;
+      let ivInfoText = "";
+      if (["cbc", "ctr", "gcm"].includes(mode)) {
+        if (ivMode === "auto") {
+          if (op === "decrypt") {
+            resultDiv.innerText =
+              "복호화 시에는 IV를 자동 생성할 수 없습니다.\n암호화 시 사용한 IV를 수동으로 입력하세요.";
+            updateLengthFromElementText("aesResult", "lenAesResult");
+            return;
+          }
+          // 암호화 + auto → 랜덤 IV 생성
+          ivBytes = generateRandomIv(mode);
+          const ivLabel = (encOutEnc === "hex") ? "IV HEX" : "IV Base64";
+          const ivStrOut = (encOutEnc === "hex")
+            ? bytesToHex(ivBytes)
+            : bytesToBase64(ivBytes);
+          ivInfoText = `\n(${ivLabel}: ${ivStrOut})`;
+        } else {
+          // 수동 입력 (hex / base64)
+          if (!ivStr) {
+            resultDiv.innerText = "선택한 블록모드에서는 IV가 필요합니다.";
+            updateLengthFromElementText("aesResult", "lenAesResult");
+            return;
+          }
+          if (ivMode === "hex") ivBytes = hexToBytes(ivStr);
+          else ivBytes = base64ToBytes(ivStr);
+        }
+      }
+
+      // 3. 데이터 처리
+      let dataBytes;
+      if (dataFormat === "plain") {
+        dataBytes = textToBytes(dataStr);
+      } else if (dataFormat === "hex") {
+        dataBytes = hexToBytes(dataStr);
+      } else { // base64
+        dataBytes = base64ToBytes(dataStr);
+      }
+
+      // 4. 알고리즘 이름 매핑
+      let algoName;
+      if (mode === "cbc") algoName = "AES-CBC";
+      else if (mode === "ctr") algoName = "AES-CTR";
+      else if (mode === "gcm") algoName = "AES-GCM";
+      else {
+        resultDiv.innerText = "지원되지 않는 모드입니다.";
+        updateLengthFromElementText("aesResult", "lenAesResult");
+        return;
+      }
+
+      // 5. 키 import
+      const key = await crypto.subtle.importKey(
+        "raw",
+        keyBytes,
+        { name: algoName, length: keyBits },
+        false,
+        ["encrypt", "decrypt"]
+      );
+
+      // 6. 알고리즘 파라미터
+      let algorithm;
+      if (algoName === "AES-CBC") {
+        algorithm = { name: "AES-CBC", iv: ivBytes };
+      } else if (algoName === "AES-CTR") {
+        algorithm = { name: "AES-CTR", counter: ivBytes, length: 64 };
+      } else if (algoName === "AES-GCM") {
+        algorithm = { name: "AES-GCM", iv: ivBytes, tagLength: 128 };
+      }
+
+      // 7. 암/복호화 수행
+      if (op === "encrypt") {
+        const cipherBuffer = await crypto.subtle.encrypt(algorithm, key, dataBytes);
+        const cipherBytes = new Uint8Array(cipherBuffer);
+
+        const out = (encOutEnc === "hex")
+          ? bytesToHex(cipherBytes)
+          : bytesToBase64(cipherBytes);
+
+        resultDiv.innerText = out + ivInfoText;
+        updateLengthFromElementText("aesResult", "lenAesResult");
+      } else {
+        // decrypt
+        try {
+          const plainBuffer = await crypto.subtle.decrypt(algorithm, key, dataBytes);
+          const plainBytes = new Uint8Array(plainBuffer);
+
+          let out;
+          if (decOutFormat === "plain") {
+            // UTF-8 문자열로 디코딩 시도
+            try {
+              out = bytesToText(plainBytes);
+            } catch {
+              out = "[UTF-8 디코딩 실패] HEX: " + bytesToHex(plainBytes);
+            }
+          } else if (decOutFormat === "hex") {
+            out = bytesToHex(plainBytes);
+          } else { // base64
+            out = bytesToBase64(plainBytes);
+          }
+
+          resultDiv.innerText = out;
+          updateLengthFromElementText("aesResult", "lenAesResult");
+        } catch (e) {
+          console.error(e);
+          resultDiv.innerText = "복호화 실패 (키/IV/모드/데이터를 확인하세요)";
+          updateLengthFromElementText("aesResult", "lenAesResult");
+        }
+      }
+    } catch (e) {
+      console.error(e);
+      resultDiv.innerText = "처리 중 오류가 발생했습니다. 입력값과 설정을 확인하세요.";
+      updateLengthFromElementText("aesResult", "lenAesResult");
+    }
+  }
+
+  function clearAes() {
+    // ... (기존 clearAes 로직 유지)
+    document.getElementById("aesInput").value = "";
+    document.getElementById("aesKeyInput").value = "";
+    document.getElementById("aesIvInput").value = "";
+    document.getElementById("aesResult").innerText = "";
+
+    document.getElementById("aesOperation").value = "encrypt";
+    document.getElementById("aesDataFormat").value = "plain";
+    document.getElementById("aesKeyEncoding").value = "hex";
+    document.getElementById("aesKeySize").value = "256";
+    document.getElementById("aesBlockMode").value = "cbc";
+    document.getElementById("aesPadding").value = "pkcs7";
+    document.getElementById("aesEncryptEncoding").value = "hex";
+    document.getElementById("aesDecryptOutputFormat").value = "plain";
+    document.getElementById("aesIvMode").value = "auto";
+
+    updateIvVisibility();
+    updateLengthFromInput("aesInput", "lenAesInput");
+    updateLengthFromInput("aesKeyInput", "lenAesKeyInput");
+    updateLengthFromInput("aesIvInput", "lenAesIvInput");
+    updateLengthFromElementText("aesResult", "lenAesResult");
+  }
+
+  /* ============ PBKDF2 키 스트레칭 (기존 코드) ============ */
+
+  let pbkdf2LastKey = "";
+  let pbkdf2LastKeyEncoding = "hex"; // hex or base64
+
+  async function runPbkdf2() {
+    // ... (기존 runPbkdf2 로직 유지)
+    const secretStr = document.getElementById("pbkdf2SecretInput").value.trim();
+    const saltStr   = document.getElementById("pbkdf2SaltInput").value.trim();
+    const secretEnc = document.getElementById("pbkdf2SecretEncoding").value;
+    const saltEnc   = document.getElementById("pbkdf2SaltEncoding").value;
+    const hashAlg   = document.getElementById("pbkdf2Hash").value;
+    const iter      = parseInt(document.getElementById("pbkdf2Iterations").value, 10) || 0;
+    const keyBits   = parseInt(document.getElementById("pbkdf2KeyLength").value, 10);
+    const outEnc    = document.getElementById("pbkdf2OutputEncoding").value;
+
+    const resultDiv = document.getElementById("pbkdf2Result");
+
+    if (!secretStr) {
+      alert("secret(비밀번호)를 입력해 주세요.");
+      return;
+    }
+    if (saltEnc !== "auto" && !saltStr) {
+      alert("salt 값을 입력해 주세요.");
+      return;
+    }
+    if (!iter || iter <= 0) {
+      alert("iteration 횟수를 1 이상으로 입력해 주세요.");
+      return;
+    }
+
+    if (!window.crypto || !window.crypto.subtle) {
+      resultDiv.innerText =
+        "이 브라우저에서는 Web Crypto API(crypto.subtle)를 지원하지 않습니다.";
+      updateLengthFromElementText("pbkdf2Result", "lenPbkdf2Result");
+      return;
+    }
+
+    try {
+      let secretBytes;
+      if (secretEnc === "plain") secretBytes = textToBytes(secretStr);
+      else if (secretEnc === "hex") secretBytes = hexToBytes(secretStr);
+      else secretBytes = base64ToBytes(secretStr);
+
+      let saltBytes;
+      if (saltEnc === "auto") {
+        // 16바이트 랜덤 salt 생성
+        saltBytes = new Uint8Array(16);
+        crypto.getRandomValues(saltBytes);
+      } else {
+        if (saltEnc === "plain") saltBytes = textToBytes(saltStr);
+        else if (saltEnc === "hex") saltBytes = hexToBytes(saltStr);
+        else saltBytes = base64ToBytes(saltStr);
+      }
+
+      const baseKey = await crypto.subtle.importKey(
+        "raw",
+        secretBytes,
+        { name: "PBKDF2" },
+        false,
+        ["deriveBits"]
+      );
+
+      const bits = await crypto.subtle.deriveBits(
+        {
+          name: "PBKDF2",
+          hash: hashAlg,
+          salt: saltBytes,
+          iterations: iter
+        },
+        baseKey,
+        keyBits
+      );
+
+      const keyBytes = new Uint8Array(bits);
+      let keyStr;
+      if (outEnc === "hex") keyStr = bytesToHex(keyBytes);
+      else keyStr = bytesToBase64(keyBytes);
+
+      pbkdf2LastKey = keyStr;
+      pbkdf2LastKeyEncoding = outEnc;
+
+      const saltHex = bytesToHex(saltBytes);
+
+      // 결과: 키 + 사용된 salt(HEX) 표시
+      const text = keyStr + "\n(Salt HEX: " + saltHex + ")";
+      resultDiv.innerText = text;
+      updateLengthFromElementText("pbkdf2Result", "lenPbkdf2Result");
+    } catch (e) {
+      console.error(e);
+      resultDiv.innerText = "PBKDF2 처리 중 오류가 발생했습니다. 입력값을 확인하세요.";
+      updateLengthFromElementText("pbkdf2Result", "lenPbkdf2Result");
+    }
+  }
+
+  function applyPbkdf2KeyToAes() {
+    // ... (기존 applyPbkdf2KeyToAes 로직 유지)
+    if (!pbkdf2LastKey) {
+      alert("먼저 PBKDF2로 키를 생성해 주세요.");
+      return;
+    }
+    document.getElementById("aesKeyEncoding").value =
+      (pbkdf2LastKeyEncoding === "hex") ? "hex" : "base64";
+    document.getElementById("aesKeyInput").value = pbkdf2LastKey;
+    updateLengthFromInput("aesKeyInput", "lenAesKeyInput");
+    alert("PBKDF2로 생성된 키를 AES 키 입력에 적용했습니다.");
+  }
+
+  function clearPbkdf2() {
+    // ... (기존 clearPbkdf2 로직 유지)
+    document.getElementById("pbkdf2SecretInput").value = "";
+    document.getElementById("pbkdf2SaltInput").value = "";
+    document.getElementById("pbkdf2Result").innerText = "";
+
+    document.getElementById("pbkdf2SecretEncoding").value = "plain";
+    document.getElementById("pbkdf2SaltEncoding").value = "auto";
+    document.getElementById("pbkdf2Hash").value = "SHA-256";
+    document.getElementById("pbkdf2Iterations").value = "100000";
+    document.getElementById("pbkdf2KeyLength").value = "256";
+    document.getElementById("pbkdf2OutputEncoding").value = "hex";
+
+    pbkdf2LastKey = "";
+    pbkdf2LastKeyEncoding = "hex";
+
+    onPbkdf2SaltEncodingChange();
+    updateLengthFromInput("pbkdf2SecretInput", "lenPbkdf2SecretInput");
+    updateLengthFromInput("pbkdf2SaltInput", "lenPbkdf2SaltInput");
+    updateLengthFromElementText("pbkdf2Result", "lenPbkdf2Result");
+  }
+  
+  /* ============ RSA 키 쌍 및 암/복호화 (추가된 기능) ============ */
+  
+  let rsaGeneratedKeyPair = null; // 생성된 키 쌍 저장
+
+  // 1. Public Key - Private Key 쌍 생성
+  async function generateRsaKeys() {
+    if (!window.crypto || !window.crypto.subtle) {
+      alert("이 브라우저에서는 Web Crypto API(crypto.subtle)를 지원하지 않습니다.");
+      return;
+    }
+
+    const keySize = parseInt(document.getElementById("rsaKeySize").value, 10);
+    const hashAlg = document.getElementById("rsaHash").value;
+    
+    try {
+      const keyPair = await crypto.subtle.generateKey(
+        {
+          name: "RSA-OAEP",
+          modulusLength: keySize,
+          publicExponent: new Uint8Array([0x01, 0x00, 0x01]), // 65537
+          hash: { name: hashAlg },
+        },
+        true, // extractable
+        ["encrypt", "decrypt"]
+      );
+      
+      rsaGeneratedKeyPair = keyPair;
+
+      // 키 export (SPKI/PKCS8 + Base64)
+      const pubKeyBuffer = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+      const privKeyBuffer = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+
+      const pubKeyBase64 = bytesToBase64(new Uint8Array(pubKeyBuffer));
+      const privKeyBase64 = bytesToBase64(new Uint8Array(privKeyBuffer));
+      
+      document.getElementById("rsaPublicKeyOutput").innerText = pubKeyBase64;
+      document.getElementById("rsaPrivateKeyOutput").innerText = privKeyBase64;
+      
+      updateLengthFromElementText("rsaPublicKeyOutput", "lenRsaPublicKeyOutput");
+      updateLengthFromElementText("rsaPrivateKeyOutput", "lenRsaPrivateKeyOutput");
+      
+      alert(`RSA ${keySize} bit 키 쌍이 생성되었습니다.`);
+
+    } catch (e) {
+      console.error(e);
+      alert("RSA 키 쌍 생성 중 오류가 발생했습니다. 브라우저 지원 여부를 확인하세요.");
+    }
+  }
+
+  // 2. RSA 암호화
+  async function runRsaEncryption() {
+    const dataStr = document.getElementById("rsaDataInput").value.trim();
+    const dataFormat = document.getElementById("rsaDataFormat").value; // plain/hex/base64
+    const keySource = document.getElementById("rsaKeySource").value; // generated / input
+    const pubKeyStr = document.getElementById("rsaPublicKeyInput").value.trim();
+    const hashAlg = document.getElementById("rsaHash").value;
+    const resultDiv = document.getElementById("rsaResult");
+    
+    resultDiv.innerText = "";
+    updateLengthFromElementText("rsaResult", "lenRsaResult");
+    
+    if (!dataStr) { resultDiv.innerText = "데이터를 입력해 주세요."; return; }
+    
+    try {
+      // 데이터 준비
+      let dataBytes;
+      if (dataFormat === "plain") dataBytes = textToBytes(dataStr);
+      else if (dataFormat === "hex") dataBytes = hexToBytes(dataStr);
+      else dataBytes = base64ToBytes(dataStr);
+
+      // 암호화 키 가져오기
+      let publicKey;
+      
+      if (keySource === "generated") {
+        if (!rsaGeneratedKeyPair) {
+          resultDiv.innerText = "키 쌍을 먼저 생성해 주세요."; return;
+        }
+        publicKey = rsaGeneratedKeyPair.publicKey;
+      } else {
+        if (!pubKeyStr) {
+          resultDiv.innerText = "Public Key를 입력해 주세요."; return;
+        }
+        const keyBytes = base64ToBytes(pubKeyStr);
+        publicKey = await crypto.subtle.importKey(
+          "spki",
+          keyBytes,
+          { name: "RSA-OAEP", hash: { name: hashAlg } },
+          false,
+          ["encrypt"]
+        );
+      }
+      
+      // 암호화 수행
+      const cipherBuffer = await crypto.subtle.encrypt(
+        { name: "RSA-OAEP" },
+        publicKey,
+        dataBytes
+      );
+      
+      const cipherBytes = new Uint8Array(cipherBuffer);
+      const output = bytesToBase64(cipherBytes); // RSA 결과는 Base64로 통일
+
+      resultDiv.innerText = output;
+      updateLengthFromElementText("rsaResult", "lenRsaResult");
+
+    } catch (e) {
+      console.error(e);
+      resultDiv.innerText = "RSA 암호화 실패. 데이터 크기, Public Key, 해시 알고리즘 등을 확인하세요.";
+      updateLengthFromElementText("rsaResult", "lenRsaResult");
+    }
+  }
+
+  // 3. RSA 복호화
+  async function runRsaDecryption() {
+    const dataStr = document.getElementById("rsaDataInput").value.trim();
+    const keySource = document.getElementById("rsaKeySource").value; // generated / input
+    const privKeyStr = document.getElementById("rsaPrivateKeyInput").value.trim();
+    const decOutFormat = document.getElementById("rsaDecryptOutputFormat").value; // plain/hex/base64
+    const hashAlg = document.getElementById("rsaHash").value;
+    const resultDiv = document.getElementById("rsaResult");
+    
+    resultDiv.innerText = "";
+    updateLengthFromElementText("rsaResult", "lenRsaResult");
+    
+    if (!dataStr) { resultDiv.innerText = "암호화된 데이터를 입력해 주세요."; return; }
+
+    try {
+      // 데이터 준비 (암호화 결과는 Base64로 가정)
+      const dataBytes = base64ToBytes(dataStr);
+
+      // 복호화 키 가져오기
+      let privateKey;
+      
+      if (keySource === "generated") {
+        if (!rsaGeneratedKeyPair) {
+          resultDiv.innerText = "키 쌍을 먼저 생성해 주세요."; return;
+        }
+        privateKey = rsaGeneratedKeyPair.privateKey;
+      } else {
+        if (!privKeyStr) {
+          resultDiv.innerText = "Private Key를 입력해 주세요."; return;
+        }
+        const keyBytes = base64ToBytes(privKeyStr);
+        privateKey = await crypto.subtle.importKey(
+          "pkcs8",
+          keyBytes,
+          { name: "RSA-OAEP", hash: { name: hashAlg } },
+          false,
+          ["decrypt"]
+        );
+      }
+
+      // 복호화 수행
+      const plainBuffer = await crypto.subtle.decrypt(
+        { name: "RSA-OAEP" },
+        privateKey,
+        dataBytes
+      );
+      
+      const plainBytes = new Uint8Array(plainBuffer);
+      
+      let output;
+      if (decOutFormat === "plain") {
+        try {
+          output = bytesToText(plainBytes);
+        } catch {
+          output = "[UTF-8 디코딩 실패] HEX: " + bytesToHex(plainBytes);
+        }
+      } else if (decOutFormat === "hex") {
+        output = bytesToHex(plainBytes);
+      } else { // base64
+        output = bytesToBase64(plainBytes);
+      }
+
+      resultDiv.innerText = output;
+      updateLengthFromElementText("rsaResult", "lenRsaResult");
+
+    } catch (e) {
+      console.error(e);
+      resultDiv.innerText = "RSA 복호화 실패. Private Key, 해시 알고리즘, 암호화된 데이터 형식 등을 확인하세요.";
+      updateLengthFromElementText("rsaResult", "lenRsaResult");
+    }
+  }
+
+  function clearRsa() {
+    document.getElementById("rsaDataInput").value = "";
+    document.getElementById("rsaPublicKeyInput").value = "";
+    document.getElementById("rsaPrivateKeyInput").value = "";
+    document.getElementById("rsaPublicKeyOutput").innerText = "";
+    document.getElementById("rsaPrivateKeyOutput").innerText = "";
+    document.getElementById("rsaResult").innerText = "";
+
+    document.getElementById("rsaOperation").value = "encrypt";
+    document.getElementById("rsaDataFormat").value = "plain";
+    document.getElementById("rsaKeySize").value = "2048";
+    document.getElementById("rsaHash").value = "SHA-256";
+    document.getElementById("rsaKeySource").value = "generated";
+    document.getElementById("rsaDecryptOutputFormat").value = "plain";
+    
+    rsaGeneratedKeyPair = null;
+    
+    initLengths();
+  }
+  
+  function onRsaOperationChange() {
+    const op = document.getElementById("rsaOperation").value;
+    const decryptFormatRow = document.getElementById("rsaDecryptOutputRow");
+    const dataFormatSelect = document.getElementById("rsaDataFormat");
+    
+    if (op === "encrypt") {
+      decryptFormatRow.style.display = "none";
+      document.getElementById("rsaDataFormatLabel").innerText = "데이터 형식:";
+      if (dataFormatSelect.value === "base64") dataFormatSelect.value = "plain";
+      dataFormatSelect.querySelectorAll('option[value="base64"]').forEach(opt => opt.hidden = true);
+      dataFormatSelect.querySelectorAll('option[value="plain"]').forEach(opt => opt.hidden = false);
+      
+    } else { // decrypt
+      decryptFormatRow.style.display = "flex";
+      document.getElementById("rsaDataFormatLabel").innerText = "암호문 형식:";
+      dataFormatSelect.value = "base64";
+      dataFormatSelect.querySelectorAll('option[value="base64"]').forEach(opt => opt.hidden = false);
+      dataFormatSelect.querySelectorAll('option[value="plain"]').forEach(opt => opt.hidden = true);
+      
+    }
+    document.getElementById("rsaDataInput").placeholder = (op === "encrypt") 
+      ? "암호화할 평문/데이터" 
+      : "복호화할 암호문 (Base64)";
+  }
+  
+  document.addEventListener("DOMContentLoaded", function () {
+    onBlockModeChange();
+    onPbkdf2SaltEncodingChange();
+    onRsaOperationChange(); // RSA 초기화
+    initLengths();
+  });
+  
+  function runRsa() {
+    const op = document.getElementById("rsaOperation").value;
+    if (op === "encrypt") {
+      runRsaEncryption();
+    } else {
+      runRsaDecryption();
+    }
+  }
+</script>
+
+<h2>PBKDF2 키 스트레칭</h2>
+<div class="option-row">
+  <span>secret 인코딩:</span>
+  <select id="pbkdf2SecretEncoding">
+    <option value="plain" selected>평문</option>
+    <option value="hex">HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+
+  <span>salt 인코딩:</span>
+  <select id="pbkdf2SaltEncoding" onchange="onPbkdf2SaltEncodingChange()">
+    <option value="auto" selected>자동(랜덤 생성)</option>
+    <option value="plain">평문</option>
+    <option value="hex">HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+
+  <span>Hash:</span>
+  <select id="pbkdf2Hash">
+    <option value="SHA-256" selected>SHA-256</option>
+    <option value="SHA-512">SHA-512</option>
+  </select>
+</div>
+
+<div class="row">
+  <span>secret:</span>
+  <input id="pbkdf2SecretInput" type="text"
+         placeholder="비밀번호 / 시크릿 값"
+         oninput="updateLengthFromInput('pbkdf2SecretInput','lenPbkdf2SecretInput')">
+  <div id="lenPbkdf2SecretInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('pbkdf2SecretInput')">복사</button>
+</div>
+
+<div id="pbkdf2SaltRow" class="row">
+  <span>salt:</span>
+  <input id="pbkdf2SaltInput" type="text"
+         placeholder="salt 값 (auto가 아닌 경우 직접 입력)"
+         oninput="updateLengthFromInput('pbkdf2SaltInput','lenPbkdf2SaltInput')">
+  <div id="lenPbkdf2SaltInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('pbkdf2SaltInput')">복사</button>
+</div>
+
+<div class="option-row">
+  <span>iterations:</span>
+  <input id="pbkdf2Iterations" type="number" min="1" value="100000" style="width: 120px;">
+
+  <span>키 길이:</span>
+  <select id="pbkdf2KeyLength">
+    <option value="128">128 bit</option>
+    <option value="256" selected>256 bit</option>
+  </select>
+
+  <span>출력 인코딩:</span>
+  <select id="pbkdf2OutputEncoding">
+    <option value="hex" selected>HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+</div>
+
+<div class="row">
+  <button onclick="runPbkdf2()">PBKDF2 키 생성</button>
+  <button onclick="applyPbkdf2KeyToAes()">생성된 키 → AES 키 적용</button>
+  <button onclick="clearPbkdf2()">초기화</button>
+</div>
+
+<div>
+  <strong>PBKDF2 결과 키:</strong>
+  <div class="result-row">
+    <div id="pbkdf2Result" class="result-box"></div>
+    <div id="lenPbkdf2Result" class="len-box"></div>
+    <button class="copy-btn" onclick="copyText('pbkdf2Result')">복사</button>
+  </div>
+</div>
+
+<small class="note">
+  ※ PBKDF2 결과는 첫 줄에 파생 키, 괄호 안에 사용된 Salt(HEX)를 함께 표시합니다.<br>
+  ※ "생성된 키 → AES 키 적용"을 클릭하면 아래 AES 키 입력 칸에 자동으로 채워집니다.
+</small>
+
+<hr>
+
+<h2>AES 암호화/복호화</h2>
+<div class="option-row">
+  <span>1. 동작:</span>
+  <select id="aesOperation">
+    <option value="encrypt">암호화</option>
+    <option value="decrypt">복호화</option>
+  </select>
+
+  <span>2. 데이터 형식:</span>
+  <select id="aesDataFormat">
+    <option value="plain">평문(UTF-8)</option>
+    <option value="hex">HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+</div>
+
+<div class="row">
+  <span>데이터:</span>
+  <input id="aesInput" type="text"
+         placeholder="암호화/복호화 대상 데이터"
+         oninput="updateLengthFromInput('aesInput','lenAesInput')">
+  <div id="lenAesInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('aesInput')">복사</button>
+</div>
+
+<hr>
+
+<div class="option-row">
+  <span>3. 키 인코딩:</span>
+  <select id="aesKeyEncoding">
+    <option value="hex">HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+
+  <span>4. 키 길이:</span>
+  <select id="aesKeySize">
+    <option value="128">128 bit</option>
+    <option value="256" selected>256 bit</option>
+  </select>
+</div>
+
+<div class="row">
+  <span>키:</span>
+  <input id="aesKeyInput" type="text"
+         placeholder="키를 선택한 인코딩 형식으로 입력 (또는 위 PBKDF2 결과 적용)"
+         oninput="updateLengthFromInput('aesKeyInput','lenAesKeyInput')">
+  <div id="lenAesKeyInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('aesKeyInput')">복사</button>
+</div>
+
+<hr>
+
+<div class="option-row">
+  <span>5. 블록 모드:</span>
+  <select id="aesBlockMode" onchange="onBlockModeChange()">
+    <option value="ecb">ECB (미지원)</option>
+    <option value="cbc" selected>CBC</option>
+    <option value="cfb">CFB (미지원)</option>
+    <option value="ofb">OFB (미지원)</option>
+    <option value="ctr">CTR</option>
+    <option value="gcm">GCM</option>
+  </select>
+
+  <span>6. Padding:</span>
+  <select id="aesPadding">
+    <option value="nopad">NoPadding</option>
+    <option value="pkcs5">PKCS5</option>
+    <option value="pkcs7" selected>PKCS7</option>
+  </select>
+</div>
+
+<div class="option-row">
+  <span>IV 모드:</span>
+  <select id="aesIvMode" onchange="onIvModeChange()">
+    <option value="auto" selected>자동 생성 (암호화 시)</option>
+    <option value="hex">수동 입력 (HEX)</option>
+    <option value="base64">수동 입력 (Base64)</option>
+  </select>
+</div>
+
+<div id="ivRow" class="row">
+  <span>IV:</span>
+  <input id="aesIvInput" type="text"
+         placeholder="IV를 선택한 형식으로 입력"
+         oninput="updateLengthFromInput('aesIvInput','lenAesIvInput')">
+  <div id="lenAesIvInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('aesIvInput')">복사</button>
+</div>
+
+<div class="option-row">
+  <span>7-1. 암호화 결과 인코딩:</span>
+  <select id="aesEncryptEncoding">
+    <option value="hex" selected>HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+
+  <span>7-2. 복호화 결과 형식:</span>
+  <select id="aesDecryptOutputFormat">
+    <option value="plain" selected>평문(UTF-8)</option>
+    <option value="hex">HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+</div>
+
+<small class="note">
+  ※ CBC/CTR/GCM에서 IV는 일반적으로 16바이트(또는 GCM의 경우 12바이트)를 권장합니다.<br>
+  ※ IV 모드가 "자동 생성"일 때는 암호화 시에만 랜덤 IV를 만들고, 결과에 함께 표시합니다.<br>
+  ※ 복호화 시에는 암호화에 사용된 IV를 동일하게 수동 입력해야 합니다.
+</small>
+
+<div class="row" style="margin-top: 12px;">
+  <button onclick="runAes()">실행</button>
+  <button onclick="clearAes()">초기화</button>
+</div>
+
+<div>
+  <strong>AES 결과:</strong>
+  <div class="result-row">
+    <div id="aesResult" class="result-box"></div>
+    <div id="lenAesResult" class="len-box"></div>
+    <button class="copy-btn" onclick="copyText('aesResult')">복사</button>
+  </div>
+</div>
+
+<hr>
+
+<h2>RSA 공개키/개인키 (RSA-OAEP)</h2>
+
+<div class="option-row">
+  <span>키 길이:</span>
+  <select id="rsaKeySize">
+    <option value="2048" selected>2048 bit</option>
+    <option value="4096">4096 bit</option>
+  </select>
+
+  <span>Hash (OAEP):</span>
+  <select id="rsaHash">
+    <option value="SHA-256" selected>SHA-256</option>
+    <option value="SHA-512">SHA-512</option>
+  </select>
+  <button onclick="generateRsaKeys()">🔑 RSA 키 쌍 생성</button>
+  <button onclick="clearRsa()">초기화</button>
+</div>
+
+<div>
+  <strong>Public Key (SPKI, Base64):</strong>
+  <div class="result-row">
+    <div id="rsaPublicKeyOutput" class="result-box key-output"></div>
+    <div id="lenRsaPublicKeyOutput" class="len-box"></div>
+    <button class="copy-btn" onclick="copyText('rsaPublicKeyOutput')">복사</button>
+  </div>
+</div>
+
+<div>
+  <strong>Private Key (PKCS#8, Base64):</strong>
+  <div class="result-row">
+    <div id="rsaPrivateKeyOutput" class="result-box key-output"></div>
+    <div id="lenRsaPrivateKeyOutput" class="len-box"></div>
+    <button class="copy-btn" onclick="copyText('rsaPrivateKeyOutput')">복사</button>
+  </div>
+</div>
+
+<hr>
+
+<div class="option-row">
+  <span>1. 동작:</span>
+  <select id="rsaOperation" onchange="onRsaOperationChange()">
+    <option value="encrypt">암호화</option>
+    <option value="decrypt">복호화</option>
+  </select>
+
+  <span id="rsaDataFormatLabel">2. 데이터 형식:</span>
+  <select id="rsaDataFormat">
+    <option value="plain" selected>평문(UTF-8)</option>
+    <option value="hex">HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+</div>
+
+<div id="rsaDecryptOutputRow" class="option-row" style="display: none;">
+  <span>복호화 결과 형식:</span>
+  <select id="rsaDecryptOutputFormat">
+    <option value="plain" selected>평문(UTF-8)</option>
+    <option value="hex">HEX</option>
+    <option value="base64">Base64</option>
+  </select>
+</div>
+
+<div class="row">
+  <span>데이터:</span>
+  <input id="rsaDataInput" type="text"
+         placeholder="암호화/복호화 대상 데이터"
+         oninput="updateLengthFromInput('rsaDataInput','lenRsaDataInput')">
+  <div id="lenRsaDataInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('rsaDataInput')">복사</button>
+</div>
+
+<div class="option-row">
+  <span>3. 키 사용:</span>
+  <select id="rsaKeySource">
+    <option value="generated" selected>위에서 생성된 키 사용</option>
+    <option value="input">수동 입력 키 사용</option>
+  </select>
+</div>
+
+<div class="row">
+  <span>Public Key:</span>
+  <input id="rsaPublicKeyInput" type="text"
+         placeholder="Public Key (Base64, 수동 입력 시)"
+         oninput="updateLengthFromInput('rsaPublicKeyInput','lenRsaPublicKeyInput')">
+  <div id="lenRsaPublicKeyInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('rsaPublicKeyInput')">복사</button>
+</div>
+
+<div class="row">
+  <span>Private Key:</span>
+  <input id="rsaPrivateKeyInput" type="text"
+         placeholder="Private Key (Base64, 수동 입력 시)"
+         oninput="updateLengthFromInput('rsaPrivateKeyInput','lenRsaPrivateKeyInput')">
+  <div id="lenRsaPrivateKeyInput" class="len-box"></div>
+  <button class="copy-btn" onclick="copyInput('rsaPrivateKeyInput')">복사</button>
+</div>
+
+<small class="note">
+  ※ 암호화: Public Key 사용. 결과는 Base64 암호문입니다.<br>
+  ※ 복호화: Private Key 사용. 데이터 입력 형식은 Base64로 설정됩니다.<br>
+  ※ RSA-OAEP는 키 길이에 따라 암호화할 수 있는 **데이터 크기에 제한**이 있습니다.
+</small>
+
+<div class="row" style="margin-top: 12px;">
+  <button onclick="runRsa()">실행</button>
+</div>
+
+<div>
+  <strong>RSA 결과:</strong>
+  <div class="result-row">
+    <div id="rsaResult" class="result-box"></div>
+    <div id="lenRsaResult" class="len-box"></div>
+    <button class="copy-btn" onclick="copyText('rsaResult')">복사</button>
+  </div>
+</div>
+
+</body>
+</html>
